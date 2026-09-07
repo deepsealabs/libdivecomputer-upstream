@@ -903,10 +903,11 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	DEBUG (abstract->context, "Decompressed " DC_PRINTF_SIZE " bytes for logbook entry %s.",
 		dc_buffer_get_size (raw), logbook_id);
 
-	// Append the /Summary SBEM (gradient factors, gas mix) after the
-	// profile, so the parser can expose them via DC_FIELD_DECOMODEL /
-	// DC_FIELD_GASMIX -- these aren't in the profile stream. Best-effort:
-	// the profile alone is still a valid dive if this fails.
+	// Append the /Summary SBEM (gradient factors, gas mix, cylinder size,
+	// PO2 max) after the profile, so the parser can expose them via
+	// DC_FIELD_DECOMODEL / DC_FIELD_GASMIX / DC_FIELD_TANK / DC_FIELD_PPO2 --
+	// these aren't in the profile stream. Best-effort: the profile alone is
+	// still a valid dive if this fails.
 	dc_buffer_t *summary = dc_buffer_new (0);
 	if (summary != NULL) {
 		if (suunto_nautic_device_download_summary (abstract, logbook_id, summary) == DC_STATUS_SUCCESS &&

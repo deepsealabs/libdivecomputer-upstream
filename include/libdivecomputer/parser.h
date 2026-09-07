@@ -66,6 +66,7 @@ typedef enum dc_field_type_t {
 	DC_FIELD_DIVEMODE,
 	DC_FIELD_DECOMODEL,
 	DC_FIELD_LOCATION,
+	DC_FIELD_PPO2, /* double, bar -- the diver's configured working ppO2 ceiling (Suunto Nautic /Summary) */
 } dc_field_type_t;
 
 typedef enum parser_sample_event_t {

@@ -158,6 +158,8 @@ typedef struct suunto_nautic_parser_t {
 	dc_decomodel_t decomodel;
 	unsigned int have_tankvolume;
 	double tankvolume; // litres, from /Summary +0xD0
+	unsigned int have_ppo2max;
+	double ppo2max; // bar, the configured PO2 limit, from /Summary +0xCC
 } suunto_nautic_parser_t;
 
 typedef struct sbem_chunk_t {
@@ -286,8 +288,9 @@ suunto_nautic_find_summary (const unsigned char *data, size_t size)
 	return size;
 }
 
-// Parse gradient factors, gas mixes and the cylinder size from the /Summary
-// section, whose "SBEM0103" signature is at `sbem` (length `size`). Offsets
+// Parse gradient factors, gas mixes, the cylinder size and the PO2 max from
+// the /Summary section, whose "SBEM0103" signature is at `sbem` (length
+// `size`). Offsets
 // are relative to that signature (confirmed on real hardware). Gases are
 // validated by plausibility (O2 in 1..100, He in 0..100-O2) and counted
 // until the first implausible slot, since unused slots hold unrelated bytes.
@@ -309,6 +312,14 @@ suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char
 		if (m3 > 0.0005 && m3 < 0.05) { // 0.5 .. 50 L
 			parser->tankvolume = m3 * 1000.0; // m^3 -> litres
 			parser->have_tankvolume = 1;
+		}
+	}
+
+	if (size >= SUMMARY_PPO2_MAX + 4) {
+		double bar = array_float_le (sbem + SUMMARY_PPO2_MAX);
+		if (bar > 0.5 && bar < 3.0) { // the watch offers 1.2 .. 1.6
+			parser->ppo2max = bar;
+			parser->have_ppo2max = 1;
 		}
 	}
 
@@ -945,6 +956,11 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		if (!parser->have_decomodel)
 			return DC_STATUS_UNSUPPORTED;
 		*((dc_decomodel_t *) value) = parser->decomodel;
+		break;
+	case DC_FIELD_PPO2:
+		if (!parser->have_ppo2max)
+			return DC_STATUS_UNSUPPORTED;
+		*((double *) value) = parser->ppo2max;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;
