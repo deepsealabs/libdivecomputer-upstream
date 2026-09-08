@@ -121,6 +121,7 @@
 // gives low > high.
 #define SUMMARY_GF_LOW   0x35 // uint16 LE, %
 #define SUMMARY_GF_HIGH  0x33 // uint16 LE, %
+#define SUMMARY_WATER_TYPE 0x3E // uint8 enum: 0 fresh, 1 EN13319, 2 salt
 // Gas/cylinder records: an array starting at SUMMARY_GAS_BASE, one 45-byte
 // record per configured gas. The record index equals the cylinder slot
 // (GasNumber), so tank i uses gas i. Within a record: O2% at +1, He% at +2,
@@ -166,6 +167,8 @@ typedef struct suunto_nautic_parser_t {
 	dc_decomodel_t decomodel;
 	unsigned int have_ppo2max;
 	double ppo2max; // bar, configured oxygen partial-pressure limit
+	unsigned int have_salinity;
+	dc_salinity_t salinity;
 } suunto_nautic_parser_t;
 
 typedef struct sbem_chunk_t {
@@ -310,6 +313,17 @@ suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char
 		parser->decomodel.params.gf.low = low;
 		parser->decomodel.params.gf.high = high;
 		parser->have_decomodel = 1;
+	}
+
+	// Water type at +0x3E (uint8): 0 fresh, 1 EN13319, 2 salt.
+	if (size > SUMMARY_WATER_TYPE) {
+		unsigned int wt = sbem[SUMMARY_WATER_TYPE];
+		if (wt <= 2) {
+			static const double density[] = {1000.0, 1020.0, 1030.0};
+			parser->salinity.type = wt ? DC_WATER_SALT : DC_WATER_FRESH;
+			parser->salinity.density = density[wt];
+			parser->have_salinity = 1;
+		}
 	}
 
 	for (unsigned int i = 0; i < MAX_GASMIXES; i++) {
@@ -873,6 +887,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->have_decomodel = 0;
 	parser->have_ppo2max = 0;
 	parser->ppo2max = 0.0;
+	parser->have_salinity = 0;
+	memset (&parser->salinity, 0, sizeof (parser->salinity));
 	memset (parser->gasmix, 0, sizeof (parser->gasmix));
 	memset (parser->gasvolume, 0, sizeof (parser->gasvolume));
 	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
@@ -999,6 +1015,11 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		if (!parser->have_ppo2max)
 			return DC_STATUS_UNSUPPORTED;
 		*((double *) value) = parser->ppo2max;
+		break;
+	case DC_FIELD_SALINITY:
+		if (!parser->have_salinity)
+			return DC_STATUS_UNSUPPORTED;
+		*((dc_salinity_t *) value) = parser->salinity;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;
