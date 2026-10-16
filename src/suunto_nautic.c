@@ -32,71 +32,89 @@
 #include "hdlc.h"
 #include "heatshrink/heatshrink_decoder.h"
 
+#include <libdivecomputer/datetime.h>
+
 // See suunto_nautic.h for a description of the transport and format.
 
-#define RPC_OP_GET         0x0A
-#define RPC_OP_RELEASE     0x0B // host -> watch: release a handle bound by a GET (answered by 0x03)
-#define RPC_OP_FETCH       0x0D
-#define RPC_OP_SUBSCRIBE   0x10 // host -> watch: stream a handle (answered by 0x08)
-#define RPC_OP_UNSUBSCRIBE 0x11 // host -> watch: stop streaming a handle
-#define RPC_OP_STREAM_END  0x09 // watch -> host: the stream is closed (answers UNSUBSCRIBE)
-#define RPC_OP_DATA        0x05
+#define RPC_OP_NOTIFICATION      0x01 // watch -> host: one chunk of a subscribed stream
+#define RPC_OP_GET_REPLY         0x02
+#define RPC_OP_RELEASE_REPLY     0x03
+#define RPC_OP_DATA              0x05 // watch -> host: answers FETCH
+#define RPC_OP_SUBSCRIBE_REPLY   0x08
+#define RPC_OP_UNSUBSCRIBE_REPLY 0x09
+#define RPC_OP_GET               0x0A // host -> watch: resolve a path to a handle
+#define RPC_OP_RELEASE           0x0B // host -> watch: release a handle bound by a GET
+#define RPC_OP_FETCH             0x0D
+#define RPC_OP_SUBSCRIBE         0x10
+#define RPC_OP_UNSUBSCRIBE       0x11
+#define RPC_OP_HELLO             0x12
+#define RPC_OP_HELLO_REPLY       0x13
+
+// Packet: 0xA5 OPCODE LENGTH(2) SEQNUM(2) PAYLOAD(LENGTH) CRC32(4)
+#define RPC_START    0xA5
+#define RPC_OVERHEAD 10
+#define MAX_PAYLOAD  512
+#define MAX_PATH     240
+
+// HTTP-like status codes carried in the replies.
+#define STATUS_OK       200
+#define STATUS_CONTINUE 100 // more pages follow
 
 // A GET of a per-id path (/Logbook/byId/<id>/...) binds the id to one of the
-// resource's handle slots, [00|10 24 <resource>], until a RELEASE frees it. A
+// resource's handle slots, [00|10] 24 <resource>, until a RELEASE frees it. A
 // second GET while the 00 slot is still bound gets the 10 slot. Static paths
 // answer with an F0 handle and an unknown path with FF FF FF; neither is
-// released.
-#define RPC_HANDLE_STATIC  0xF0
-#define RPC_HANDLE_UNKNOWN 0xFF
+// released. The slot is the first byte on the wire.
+#define HANDLE_SLOT(handle) ((handle) & 0xFF)
+#define SLOT_DEFAULT 0x00
+#define SLOT_ALT     0x10
+#define SLOT_STATIC  0xF0
+#define SLOT_UNKNOWN 0xFF
 
-#define RPC_HEADER_SIZE 10 // magic(1) + opcode(1) + sublen(2) + seq(2) + 0x01 + 0x80 + 0x00 + pathlen(1)
-#define RPC_CRC_SIZE     4
+// Fetch parameter types: the /Summary page offset is an int32, the
+// /Logbook/Entries start id a uint32.
+#define PARAM_INT32  0x06
+#define PARAM_UINT32 0x07
 
-// Offset of the 3-byte session handle inside an ACK (0x02) or DATA (0x05)
-// frame: magic(1) + opcode(1) + sublen(2) + msgid(2).
-#define RPC_HANDLE_OFFSET 6
-// Offset of the 16-bit LE HTTP-like status inside a DATA (0x05) frame:
-// magic(1) + opcode(1) + sublen(2) + msgid(2) + handle(3) + flags(3).
-#define RPC_STATUS_OFFSET 12
-#define RPC_STATUS_OK       200
-#define RPC_STATUS_CONTINUE 100 // more pages follow (paginated fetch)
+// Reply payloads start with HANDLE(3) FLAGS(3) STATUS(2); a DATA reply then
+// carries the content.
+#define REPLY_STATUS  6
+#define REPLY_CONTENT 8
 
-#define MAX_PATH    240
-#define MAX_PACKET  512
+// Stream notification payload:
+// HANDLE(3) FLAGS(3) UNKNOWN(4) OFFSET(4) LENGTH(2) UNKNOWN(6) DATA(LENGTH)
+// OFFSET is the position of the chunk in the stream. The last chunk has a
+// zero length, at an offset equal to the total size.
+#define CHUNK_OFFSET 10
+#define CHUNK_LENGTH 14
+#define CHUNK_DATA   22
 
-// Dive IDs are UNIX timestamps. /Logbook/Entries embeds them as 4-aligned
-// little-endian uint32 values in a small SBEM payload among handle/flag/
-// count/CRC fields; filtering to a plausible timestamp window (2017 .. 2036)
-// isolates them. Must scan 4-aligned -- the IDs are packed adjacently, so an
-// unaligned read straddling two can invent a phantom dive.
-#define DIVE_ID_MIN 1500000000u
-#define DIVE_ID_MAX 2100000000u
+// A /Summary page is HEADER(11) DATA, with the data length at offset 3 of
+// the header. The paging offset counts data bytes only.
+#define PAGE_HEADER 11
+#define PAGE_LENGTH 3
 
-// Each entry stores start then end timestamp adjacently; an end is always
-// within a day of its start. Used to pair (start, end) so a dive's end isn't
-// listed as a second dive.
-#define DIVE_ENTRY_MAX_PAIR_GAP 86400u
+// /Logbook/Entries is HEADER(18) RECORD(24) x COUNT, with the count at offset
+// 6 of the header. A record is START(4) END(4) UNKNOWN(8) SIZE(4) UNKNOWN(4):
+// the start time is the dive id, and the size is the compressed /Data plus
+// the /Summary data bytes. An empty logbook can omit the end of the header.
+#define ENTRIES_HEADER 18
+#define ENTRIES_COUNT  6
+#define ENTRY_SIZE     24
+#define ENTRY_START    0
+#define ENTRY_LENGTH   16
 
-// Number of PMT-style chunks to accept before giving up. This is a safety
-// cap, not a protocol constant: the stream is collected until an inter-frame
-// silence, then closed explicitly with UNSUBSCRIBE (see the teardown in
-// suunto_nautic_device_stream_fetch).
-#define MAX_CHUNKS 4096
+// A /Summary is about 2.3 KB; bounds the size check when it is missing.
+#define SUMMARY_MAX_SIZE 8192
 
-// Safety cap on paginated-fetch pages (a Summary is a handful of pages).
-#define MAX_PAGES 64
+// How many times to issue a dive's stream when the watch refuses it with
+// status 423 (Locked), and to download a dive whose size doesn't match the
+// listing.
+#define STREAM_ATTEMPTS   3
+#define DOWNLOAD_ATTEMPTS 2
 
-// How many times to (re)issue a dive's stream fetch. The watch can refuse the
-// first attempt with status 423 (Locked) right after the previous dive; a short
-// backoff between attempts clears it.
-#define SUUNTO_NAUTIC_DOWNLOAD_RETRIES 4
-
-// The Suunto "MDS" chunk header wrapping each compressed block: 28 bytes,
-// with the true payload size as a u16 LE at offset 20 and the compressed
-// payload starting at offset 28.
-#define MDS_HEADER_SIZE     28
-#define MDS_CHUNK_SIZE_OFFSET 20
+#define TIMEOUT_DEFAULT 5000
+#define TIMEOUT_STREAM  4000 // the gap between two chunks reaches about 2s
 
 // Heatshrink (LZSS) parameters used by the Nautic/Ocean's MDS stream.
 #define HEATSHRINK_WINDOW_SZ2    7
@@ -108,14 +126,19 @@ static const unsigned char SBEM_MAGIC[8] = {'S','B','E','M','0','1','0','3'};
 typedef struct suunto_nautic_device_t {
 	dc_device_t base;
 	dc_iostream_t *iostream; // HDLC-framed
-	unsigned int sequence;
-	// The dive ID (a UNIX timestamp, see suunto_nautic_device_foreach) of
-	// the most recently downloaded dive, little-endian, as returned via
-	// dc_dive_callback_t's fingerprint parameter. All-zero means "no
-	// fingerprint set" (a real dive ID is never 0 -- that would be a
-	// 1970 timestamp), matching every other driver's convention.
+	unsigned int seqnum;
+	// The dive id (a UNIX timestamp) of the most recently downloaded dive,
+	// little-endian. All-zero means no fingerprint.
 	unsigned char fingerprint[4];
 } suunto_nautic_device_t;
+
+// Dive ids and their listed sizes, newest first.
+typedef struct suunto_nautic_entries_t {
+	unsigned int *ids;
+	unsigned int *sizes;
+	unsigned int count;
+	unsigned int capacity;
+} suunto_nautic_entries_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
 static dc_status_t suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata);
@@ -133,6 +156,19 @@ static const dc_device_vtable_t suunto_nautic_device_vtable = {
 	suunto_nautic_device_close, /* close */
 };
 
+// The Hello payload: the protocol versions (9, 9), the host identity (the one
+// the Suunto app sends, a packed 12-byte serial), the Whiteboard version
+// (4.1.2) and capability flags. The watch answers with the same fields for
+// itself.
+static const unsigned char suunto_nautic_hello[] = {
+	0x09, 0x09, 0x20, 0x16, 0x45, 0x56, 0x41, 0x10,
+	0x04, 0x41, 0x10, 0x0C, 0x00, 0x00, 0x00, 0x04,
+	0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const unsigned char suunto_nautic_noparams[] = {0x00};
+
 static dc_status_t
 suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size)
 {
@@ -149,182 +185,153 @@ suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char
 	return DC_STATUS_SUCCESS;
 }
 
-/*
- * The "EVA" handshake is the Whiteboard protocol's Hello message (message
- * type 0x12). The payload carries a SuuntoSerial identity, a fixed
- * protocol-version block, a capability-flags byte and a trailing CRC32.
- * The identity has no cryptographic tie to a specific phone, and the watch
- * has only been confirmed to answer the captured template, so it is sent
- * verbatim.
- */
-static const unsigned char suunto_nautic_eva_handshake[] = {
-	0xA5, 0x12, 0x20, 0x00, 0x00, 0x00, 0x09, 0x09, 0x20, 0x16, 0x45, 0x56,
-	0x41, 0x10, 0x04, 0x41, 0x10, 0x0C, 0x00, 0x00, 0x00, 0x04, 0x01, 0x02,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x63, 0x1B, 0x47, 0x1B
-};
-
-#define EVA_HANDSHAKE_SIZE (sizeof (suunto_nautic_eva_handshake))
-
-// Build a generic path-addressed GET request for an arbitrary endpoint.
-static dc_status_t
-suunto_nautic_build_get (unsigned char packet[], unsigned int size, unsigned int *out_len, unsigned int seq, const char *path)
+static unsigned int
+suunto_nautic_seqnum (suunto_nautic_device_t *device)
 {
-	size_t pathlen = strlen (path);
-	if (pathlen == 0 || pathlen > MAX_PATH)
-		return DC_STATUS_INVALIDARGS;
+	// Zero is the sequence number of the stream notifications.
+	device->seqnum = (device->seqnum + 1) & 0xFFFF;
+	if (device->seqnum == 0)
+		device->seqnum = 1;
 
-	unsigned int len = RPC_HEADER_SIZE + (unsigned int) pathlen + RPC_CRC_SIZE;
-	if (len > size)
-		return DC_STATUS_INVALIDARGS;
-
-	unsigned int sublen = (unsigned int) pathlen + 4;
-
-	packet[0] = 0xA5;
-	packet[1] = RPC_OP_GET;
-	array_uint16_le_set (packet + 2, (unsigned short) sublen);
-	array_uint16_le_set (packet + 4, (unsigned short) seq);
-	packet[6] = 0x01;
-	packet[7] = 0x80;
-	packet[8] = 0x00;
-	packet[9] = (unsigned char) pathlen;
-	memcpy (packet + 10, path, pathlen);
-
-	unsigned int crc = checksum_crc32r (packet, RPC_HEADER_SIZE + (unsigned int) pathlen);
-	array_uint32_le_set (packet + RPC_HEADER_SIZE + (unsigned int) pathlen, crc);
-
-	*out_len = len;
-	return DC_STATUS_SUCCESS;
-}
-
-// Build a RELEASE (0x0B) frame. Payload is [handle:3][01 80 00].
-static dc_status_t
-suunto_nautic_build_release (unsigned char packet[], unsigned int size, unsigned int *out_len,
-	unsigned int seq, const unsigned char handle[3])
-{
-	static const unsigned char tail[] = { 0x01, 0x80, 0x00 };
-	unsigned int payload = 3 + (unsigned int) sizeof (tail); // handle(3) + tail
-	unsigned int len = 4 + 2 + payload + RPC_CRC_SIZE;        // magic+opcode+sublen(4) + seq(2) + payload + crc
-	if (len > size)
-		return DC_STATUS_INVALIDARGS;
-
-	packet[0] = 0xA5;
-	packet[1] = RPC_OP_RELEASE;
-	array_uint16_le_set (packet + 2, (unsigned short) payload);
-	array_uint16_le_set (packet + 4, (unsigned short) seq);
-	memcpy (packet + 6, handle, 3);
-	memcpy (packet + 9, tail, sizeof (tail));
-
-	unsigned int crc = checksum_crc32r (packet, 6 + payload);
-	array_uint32_le_set (packet + 6 + payload, crc);
-
-	*out_len = len;
-	return DC_STATUS_SUCCESS;
-}
-
-// Build a parameterless request on a handle: SUBSCRIBE (0x10), UNSUBSCRIBE
-// (0x11) or the short FETCH (0x0D). Payload is [handle:3][01 80 00 00].
-static dc_status_t
-suunto_nautic_build_handle_op (unsigned char packet[], unsigned int size, unsigned int *out_len,
-	unsigned int seq, unsigned char opcode, const unsigned char handle[3])
-{
-	static const unsigned char tail[] = { 0x01, 0x80, 0x00, 0x00 };
-	unsigned int payload = 3 + (unsigned int) sizeof (tail); // handle(3) + tail
-	unsigned int len = 4 + 2 + payload + RPC_CRC_SIZE;        // magic+opcode+sublen(4) + seq(2) + payload + crc
-	if (len > size)
-		return DC_STATUS_INVALIDARGS;
-
-	packet[0] = 0xA5;
-	packet[1] = opcode;
-	// sublen counts seq(2)+payload minus 2, i.e. payload itself.
-	array_uint16_le_set (packet + 2, (unsigned short) payload);
-	array_uint16_le_set (packet + 4, (unsigned short) seq);
-	memcpy (packet + 6, handle, 3);
-	memcpy (packet + 9, tail, sizeof (tail));
-
-	unsigned int crc = checksum_crc32r (packet, 6 + payload);
-	array_uint32_le_set (packet + 6 + payload, crc);
-
-	*out_len = len;
-	return DC_STATUS_SUCCESS;
-}
-
-// Build the "short" fetch (opcode 0x0D) that reads a small whole resource in
-// one shot, e.g. /Logbook/Entries. This is the no-range form. NOT the ranged
-// fetch used for paginated resources (/Summary), whose payload ends
-// 01 80 00 01 06 00 [offset:4]; sending that ranged form to /Logbook/Entries
-// makes the watch reject it with a 400 Bad Request.
-static dc_status_t
-suunto_nautic_build_short_fetch (unsigned char packet[], unsigned int size, unsigned int *out_len,
-	unsigned int seq, const unsigned char handle[3])
-{
-	return suunto_nautic_build_handle_op (packet, size, out_len, seq, RPC_OP_FETCH, handle);
-}
-
-// Build a paginated fetch (opcode 0x0D) for a resource the watch returns
-// across multiple pages, e.g. /Logbook/byId/<id>/Summary. Payload is
-// [seq:2 LE][handle:3][01 80 00 01 06 00][offset:4 LE] -- the ranged form.
-// The watch answers each page with HTTP status 100 (more pages) or 200
-// (last page).
-static dc_status_t
-suunto_nautic_build_paginated_fetch (unsigned char packet[], unsigned int size, unsigned int *out_len,
-	unsigned int seq, const unsigned char handle[3], unsigned int offset)
-{
-	static const unsigned char flags[] = { 0x01, 0x80, 0x00, 0x01, 0x06, 0x00 };
-	unsigned int payload = 3 + (unsigned int) sizeof (flags) + 4; // handle(3) + flags(6) + offset(4)
-	unsigned int len = 4 + 2 + payload + RPC_CRC_SIZE;
-	if (len > size)
-		return DC_STATUS_INVALIDARGS;
-
-	packet[0] = 0xA5;
-	packet[1] = RPC_OP_FETCH;
-	array_uint16_le_set (packet + 2, (unsigned short) payload);
-	array_uint16_le_set (packet + 4, (unsigned short) seq);
-	memcpy (packet + 6, handle, 3);
-	memcpy (packet + 9, flags, sizeof (flags));
-	array_uint32_le_set (packet + 9 + (unsigned int) sizeof (flags), offset);
-
-	unsigned int crc = checksum_crc32r (packet, 6 + payload);
-	array_uint32_le_set (packet + 6 + payload, crc);
-
-	*out_len = len;
-	return DC_STATUS_SUCCESS;
+	return device->seqnum;
 }
 
 static dc_status_t
-suunto_nautic_transfer (suunto_nautic_device_t *device, const unsigned char req[], unsigned int rsize, dc_buffer_t *response)
+suunto_nautic_send (suunto_nautic_device_t *device, unsigned char opcode, unsigned int seqnum, const unsigned char data[], size_t size)
 {
 	dc_status_t status = DC_STATUS_SUCCESS;
-	dc_device_t *abstract = (dc_device_t *) device;
+	unsigned char packet[RPC_OVERHEAD + MAX_PAYLOAD] = {0};
 
-	if (device_is_cancelled (abstract))
-		return DC_STATUS_CANCELLED;
+	if (size > MAX_PAYLOAD)
+		return DC_STATUS_INVALIDARGS;
 
-	status = dc_iostream_write (device->iostream, req, rsize, NULL);
+	packet[0] = RPC_START;
+	packet[1] = opcode;
+	array_uint16_le_set (packet + 2, size);
+	array_uint16_le_set (packet + 4, seqnum);
+	if (size)
+		memcpy (packet + 6, data, size);
+
+	unsigned int crc = checksum_crc32r (packet, 6 + size);
+	array_uint32_le_set (packet + 6 + size, crc);
+
+	status = dc_iostream_write (device->iostream, packet, RPC_OVERHEAD + size, NULL);
 	if (status != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to send the RPC request.");
+		ERROR (device->base.context, "Failed to send the packet.");
 		return status;
 	}
 
-	if (response) {
-		unsigned char packet[MAX_PACKET] = {0};
-		size_t len = 0;
-		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
+	return status;
+}
+
+// Receive the packet with the given opcode and sequence number. The watch
+// serves every app connected to it over the same link, so the replies to
+// another app's requests can arrive in between. Those are recognized by their
+// sequence number and skipped.
+static dc_status_t
+suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsigned int seqnum, unsigned char data[], size_t size, size_t *actual)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	unsigned char packet[RPC_OVERHEAD + MAX_PAYLOAD] = {0};
+	size_t length = 0;
+
+	if (size > MAX_PAYLOAD)
+		return DC_STATUS_INVALIDARGS;
+
+	while (1) {
+		status = dc_iostream_read (device->iostream, packet, sizeof(packet), &length);
 		if (status != DC_STATUS_SUCCESS) {
-			ERROR (abstract->context, "Failed to receive the RPC response.");
+			ERROR (device->base.context, "Failed to receive the packet.");
 			return status;
 		}
 
-		HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "RPC RSP", packet, len);
-
-		dc_buffer_clear (response);
-		if (!dc_buffer_append (response, packet, len)) {
-			ERROR (abstract->context, "Failed to allocate memory.");
-			return DC_STATUS_NOMEMORY;
+		if (length == 0) {
+			// Two flags in a row, e.g. after the tail of a packet that was
+			// cut off when an earlier link dropped.
+			continue;
 		}
+
+		if (length < RPC_OVERHEAD) {
+			ERROR (device->base.context, "Unexpected packet size (" DC_PRINTF_SIZE ").", length);
+			return DC_STATUS_PROTOCOL;
+		}
+
+		unsigned int crc = array_uint32_le (packet + length - 4);
+		unsigned int ccrc = checksum_crc32r (packet, length - 4);
+		if (crc != ccrc) {
+			ERROR (device->base.context, "Unexpected packet checksum (%08x %08x).", crc, ccrc);
+			return DC_STATUS_PROTOCOL;
+		}
+
+		if (packet[0] != RPC_START) {
+			ERROR (device->base.context, "Unexpected packet start byte (%02x).", packet[0]);
+			return DC_STATUS_PROTOCOL;
+		}
+
+		unsigned int rsp_length = array_uint16_le (packet + 2);
+		if (rsp_length != length - RPC_OVERHEAD) {
+			ERROR (device->base.context, "Unexpected packet payload length (%u " DC_PRINTF_SIZE ").", rsp_length, length - RPC_OVERHEAD);
+			return DC_STATUS_PROTOCOL;
+		}
+
+		unsigned int rsp_opcode = packet[1];
+		unsigned int rsp_seqnum = array_uint16_le (packet + 4);
+		if (rsp_opcode != opcode || rsp_seqnum != seqnum) {
+			if (rsp_opcode == RPC_OP_NOTIFICATION) {
+				// A leftover chunk of a stream that was stopped.
+				DEBUG (device->base.context, "Skipping a stream notification.");
+			} else {
+				WARNING (device->base.context, "Skipping a packet for another request (%02x %u).", rsp_opcode, rsp_seqnum);
+			}
+			continue;
+		}
+
+		if (rsp_length > size) {
+			ERROR (device->base.context, "Unexpected packet payload length (%u " DC_PRINTF_SIZE ").", rsp_length, size);
+			return DC_STATUS_PROTOCOL;
+		}
+
+		memcpy (data, packet + 6, rsp_length);
+		*actual = rsp_length;
+
+		return status;
+	}
+}
+
+// Send a request on a handle and receive its reply: the payload is the handle
+// and its 01 80 00 resource flags, followed by the parameters, if any.
+static dc_status_t
+suunto_nautic_transfer (suunto_nautic_device_t *device, unsigned char opcode, unsigned char rsp_opcode,
+	unsigned int handle, const unsigned char params[], size_t nparams, unsigned char data[], size_t size, size_t *actual)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	unsigned char request[6 + 7] = {0};
+
+	if (nparams > sizeof(request) - 6)
+		return DC_STATUS_INVALIDARGS;
+
+	array_uint24_le_set (request, handle);
+	request[3] = 0x01;
+	request[4] = 0x80;
+	request[5] = 0x00;
+	if (nparams)
+		memcpy (request + 6, params, nparams);
+
+	unsigned int seqnum = suunto_nautic_seqnum (device);
+	status = suunto_nautic_send (device, opcode, seqnum, request, 6 + nparams);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	status = suunto_nautic_recv (device, rsp_opcode, seqnum, data, size, actual);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	if (*actual < REPLY_CONTENT) {
+		ERROR (device->base.context, "Unexpected reply size (" DC_PRINTF_SIZE ").", *actual);
+		return DC_STATUS_PROTOCOL;
 	}
 
-	return DC_STATUS_SUCCESS;
+	return status;
 }
 
 dc_status_t
@@ -342,7 +349,10 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		return DC_STATUS_NOMEMORY;
 	}
 
-	device->sequence = 1;
+	// Start at a different sequence number on every connection. After a
+	// dropped link the watch can still hold the previous session, and leaves a
+	// request unanswered that reuses one of its sequence numbers.
+	device->seqnum = ((unsigned int) dc_datetime_now () * 2654435761u) & 0xFFFF;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
@@ -351,7 +361,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		goto error_free;
 	}
 
-	status = dc_iostream_set_timeout (device->iostream, 5000);
+	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to set the timeout.");
 		goto error_close;
@@ -359,27 +369,19 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 
 	dc_iostream_purge (device->iostream, DC_DIRECTION_ALL);
 
-	// Best-effort EVA handshake. The response content can't be validated
-	// (its format isn't understood), so only the I/O round-trip is required.
-	HEXDUMP (context, DC_LOGLEVEL_DEBUG, "EVA REQ", suunto_nautic_eva_handshake, EVA_HANDSHAKE_SIZE);
-
-	status = dc_iostream_write (device->iostream, suunto_nautic_eva_handshake, EVA_HANDSHAKE_SIZE, NULL);
+	status = suunto_nautic_send (device, RPC_OP_HELLO, 0, suunto_nautic_hello, sizeof (suunto_nautic_hello));
 	if (status != DC_STATUS_SUCCESS) {
-		ERROR (context, "Failed to send the EVA handshake.");
+		ERROR (context, "Failed to send the hello.");
 		goto error_close;
 	}
 
-	unsigned char handshake_rsp[MAX_PACKET] = {0};
-	size_t handshake_len = 0;
-	status = dc_iostream_read (device->iostream, handshake_rsp, sizeof (handshake_rsp), &handshake_len);
+	unsigned char hello[sizeof (suunto_nautic_hello)] = {0};
+	size_t hello_len = 0;
+	status = suunto_nautic_recv (device, RPC_OP_HELLO_REPLY, 0, hello, sizeof (hello), &hello_len);
 	if (status != DC_STATUS_SUCCESS) {
-		ERROR (context, "Failed to receive the EVA handshake response. The device may not "
-			"support this protocol, or the handshake payload may need updating "
-			"(see suunto_nautic.h).");
+		ERROR (context, "Failed to receive the hello.");
 		goto error_close;
 	}
-
-	HEXDUMP (context, DC_LOGLEVEL_DEBUG, "EVA RSP", handshake_rsp, handshake_len);
 
 	*out = (dc_device_t *) device;
 
@@ -400,27 +402,90 @@ suunto_nautic_device_close (dc_device_t *abstract)
 	return dc_iostream_close (device->iostream);
 }
 
+// Resolve a path to a handle. The GET reply is HANDLE(3) FLAGS(3) STATUS(2).
 static dc_status_t
-suunto_nautic_device_request (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+suunto_nautic_get (suunto_nautic_device_t *device, const char *path, unsigned int *handle, unsigned int *result)
 {
-	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL)
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	size_t pathlen = strlen (path);
+	if (pathlen == 0 || pathlen > MAX_PATH)
 		return DC_STATUS_INVALIDARGS;
 
-	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+	unsigned char request[4 + MAX_PATH] = {0};
+	request[0] = 0x01;
+	request[1] = 0x80;
+	request[2] = 0x00;
+	request[3] = pathlen;
+	memcpy (request + 4, path, pathlen);
 
-	unsigned char packet[RPC_HEADER_SIZE + MAX_PATH + RPC_CRC_SIZE];
-	unsigned int len = 0;
-	dc_status_t status = suunto_nautic_build_get (packet, sizeof (packet), &len, device->sequence, path);
-	if (status != DC_STATUS_SUCCESS)
+	unsigned int seqnum = suunto_nautic_seqnum (device);
+	status = suunto_nautic_send (device, RPC_OP_GET, seqnum, request, 4 + pathlen);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (device->base.context, "Failed to send the request for %s.", path);
 		return status;
-	device->sequence++;
+	}
 
-	return suunto_nautic_transfer (device, packet, len, response);
+	unsigned char reply[REPLY_CONTENT] = {0};
+	size_t reply_len = 0;
+	status = suunto_nautic_recv (device, RPC_OP_GET_REPLY, seqnum, reply, sizeof (reply), &reply_len);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (device->base.context, "Failed to receive the reply for %s.", path);
+		return status;
+	}
+
+	if (reply_len != sizeof (reply)) {
+		ERROR (device->base.context, "Unexpected reply size (" DC_PRINTF_SIZE ").", reply_len);
+		return DC_STATUS_PROTOCOL;
+	}
+
+	*handle = array_uint24_le (reply);
+	*result = array_uint16_le (reply + REPLY_STATUS);
+
+	return status;
 }
 
-// Decompress a Heatshrink (LZSS) stream, per the parameters documented
-// above. Verified byte-for-byte against a reference implementation using
-// real captured data (see suunto_nautic.h).
+// Release a handle bound by a GET, so the next GET of the same resource binds
+// its own id to the slot. A failure only leaves the slot bound.
+static void
+suunto_nautic_release (suunto_nautic_device_t *device, unsigned int handle)
+{
+	if (HANDLE_SLOT (handle) == SLOT_STATIC || HANDLE_SLOT (handle) == SLOT_UNKNOWN)
+		return;
+
+	unsigned char reply[REPLY_CONTENT] = {0};
+	size_t reply_len = 0;
+	dc_status_t status = suunto_nautic_transfer (device, RPC_OP_RELEASE, RPC_OP_RELEASE_REPLY,
+		handle, NULL, 0, reply, sizeof (reply), &reply_len);
+	if (status != DC_STATUS_SUCCESS || array_uint16_le (reply + REPLY_STATUS) != STATUS_OK)
+		WARNING (device->base.context, "Failed to release handle %06x.", handle);
+}
+
+// Resolve a path that must exist.
+static dc_status_t
+suunto_nautic_get_handle (suunto_nautic_device_t *device, const char *path, unsigned int *handle)
+{
+	unsigned int result = 0;
+	dc_status_t status = suunto_nautic_get (device, path, handle, &result);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	if (result != STATUS_OK) {
+		ERROR (device->base.context, "Failed to resolve %s (status %u).", path, result);
+		return DC_STATUS_PROTOCOL;
+	}
+
+	// Every handle is released before the next GET, so a still bound 00 slot
+	// was left by a link that dropped during a transfer.
+	if (HANDLE_SLOT (*handle) == SLOT_ALT) {
+		WARNING (device->base.context, "Releasing the stale slot of %s.", path);
+		suunto_nautic_release (device, (*handle & ~0xFFu) | SLOT_DEFAULT);
+	}
+
+	return status;
+}
+
+// Decompress a Heatshrink (LZSS) stream, with the parameters above.
 static dc_status_t
 suunto_nautic_heatshrink_decompress (dc_context_t *context, const unsigned char *input, size_t input_size, dc_buffer_t *output)
 {
@@ -488,629 +553,461 @@ done:
 	return status;
 }
 
-// Append one MDS chunk frame's sub-payload (opcode 0x01) to `raw`: the 28-byte
-// MDS header is stripped and the true payload length is a u16 at
-// MDS_CHUNK_SIZE_OFFSET. A short or inconsistent frame is skipped with a warning
-// rather than failing the transfer; only an allocation failure is fatal.
+// Download a streamed resource (the dive profile): GET, SUBSCRIBE, the
+// notifications up to the end marker, UNSUBSCRIBE and RELEASE. Returns the
+// still compressed stream. Returns DC_STATUS_PROTOCOL when the watch refuses
+// the stream (status 423 while the previous stream's handle is still bound).
 static dc_status_t
-suunto_nautic_append_chunk (dc_context_t *context, dc_buffer_t *raw, const unsigned char *packet, size_t len)
+suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, dc_buffer_t *buffer)
 {
-	if (len < MDS_HEADER_SIZE) {
-		WARNING (context, "MDS chunk shorter than the header (" DC_PRINTF_SIZE ").", len);
-		return DC_STATUS_SUCCESS;
-	}
-
-	unsigned int chunk_size = array_uint16_le (packet + MDS_CHUNK_SIZE_OFFSET);
-	if (MDS_HEADER_SIZE + chunk_size > len) {
-		WARNING (context, "MDS chunk size (%u) exceeds the frame (" DC_PRINTF_SIZE ").", chunk_size, len);
-		return DC_STATUS_SUCCESS;
-	}
-
-	if (!dc_buffer_append (raw, packet + MDS_HEADER_SIZE, chunk_size)) {
-		ERROR (context, "Failed to allocate memory.");
-		return DC_STATUS_NOMEMORY;
-	}
-
-	return DC_STATUS_SUCCESS;
-}
-
-// GET `path` and return the 3-byte handle from its ACK.
-static dc_status_t
-suunto_nautic_get_handle (dc_device_t *abstract, const char *path, unsigned char handle[3])
-{
-	dc_buffer_t *ack = dc_buffer_new (0);
-	if (ack == NULL)
-		return DC_STATUS_NOMEMORY;
-
-	dc_status_t status = suunto_nautic_device_request (abstract, path, ack);
-	if (status != DC_STATUS_SUCCESS) {
-		dc_buffer_free (ack);
-		ERROR (abstract->context, "Failed to request %s.", path);
-		return status;
-	}
-
-	const unsigned char *ack_data = dc_buffer_get_data (ack);
-	size_t ack_size = dc_buffer_get_size (ack);
-	if (ack_size < RPC_HANDLE_OFFSET + 3) {
-		dc_buffer_free (ack);
-		ERROR (abstract->context, "ACK too short for a handle (" DC_PRINTF_SIZE ").", ack_size);
-		return DC_STATUS_DATAFORMAT;
-	}
-	memcpy (handle, ack_data + RPC_HANDLE_OFFSET, 3);
-	dc_buffer_free (ack);
-
-	return DC_STATUS_SUCCESS;
-}
-
-// Release a handle bound by a GET, so the next GET of the same resource binds
-// its own id to the slot. Best-effort: a failure only leaves the slot bound.
-static void
-suunto_nautic_release_handle (dc_device_t *abstract, const unsigned char handle[3])
-{
-	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
-
-	if (handle[0] == RPC_HANDLE_STATIC || handle[0] == RPC_HANDLE_UNKNOWN)
-		return;
-
-	unsigned char packet[32];
-	unsigned int len = 0;
-	if (suunto_nautic_build_release (packet, sizeof (packet), &len, device->sequence, handle) != DC_STATUS_SUCCESS)
-		return;
-	device->sequence++;
-
-	dc_buffer_t *reply = dc_buffer_new (0);
-	if (reply == NULL)
-		return;
-	if (suunto_nautic_transfer (device, packet, len, reply) != DC_STATUS_SUCCESS)
-		WARNING (abstract->context, "Failed to release handle %02x %02x %02x.", handle[0], handle[1], handle[2]);
-	dc_buffer_free (reply);
-}
-
-// Pull a large streamed resource (dive data): GET -> ACK(handle) -> SUBSCRIBE
-// on that handle -> collect the chunk stream -> UNSUBSCRIBE -> RELEASE.
-// Returns the raw, MDS-chunk-stripped, still-Heatshrink-compressed bytes. Small
-// listing endpoints use suunto_nautic_device_short_fetch() instead.
-static dc_status_t
-suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *raw)
-{
-	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
+	dc_status_t rc = DC_STATUS_SUCCESS;
 
-	// 1. Request the resource. The handle in the ACK is bound to this dive; a
-	// fixed handle would address whichever dive an earlier GET left bound.
-	unsigned char handle[3];
-	status = suunto_nautic_get_handle (abstract, path, handle);
+	unsigned int handle = 0;
+	status = suunto_nautic_get_handle (device, path, &handle);
 	if (status != DC_STATUS_SUCCESS)
 		return status;
 
-	// 2. Subscribe to the handle. The watch answers with a status frame
-	// (op 0x08) and starts streaming.
-	unsigned char req[32];
-	unsigned int req_len = 0;
-	status = suunto_nautic_build_handle_op (req, sizeof (req), &req_len, device->sequence, RPC_OP_SUBSCRIBE, handle);
-	if (status != DC_STATUS_SUCCESS)
-		goto release;
-	device->sequence++;
-
-	status = dc_iostream_write (device->iostream, req, req_len, NULL);
+	unsigned char reply[REPLY_CONTENT + 2] = {0};
+	size_t reply_len = 0;
+	status = suunto_nautic_transfer (device, RPC_OP_SUBSCRIBE, RPC_OP_SUBSCRIBE_REPLY,
+		handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), &reply_len);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (abstract->context, "Failed to subscribe to %s.", path);
-		goto release;
+		goto error_release;
 	}
 
-	// 3. Capture the MDS chunk frames (opcode 0x01) and pull out each
-	// one's true sub-payload: the MDS header is 28 bytes, and the payload
-	// size is a little-endian u16 at offset 20-21 (see the MDS_HEADER_SIZE
-	// comment above). For a compressed endpoint, the concatenation of
-	// these sub-payloads across all chunks is one continuous Heatshrink
-	// stream — chunk boundaries are purely a BLE/transport artifact, not
-	// boundaries in the compressed data.
-	//
-	// The watch is not ACKed per chunk: once subscribed it streams the
-	// entire response continuously, and the host buffers until an inter-frame
-	// silence (the watch only emits its own STREAM_END frame in response to an
-	// UNSUBSCRIBE, which we send once collection has gone quiet -- see the
-	// teardown below). The inter-chunk gap can reach about 2s, so keep a
-	// comfortable margin here to avoid cutting a slow link short.
-	status = dc_iostream_set_timeout (device->iostream, 4000);
+	unsigned int result = array_uint16_le (reply + REPLY_STATUS);
+	if (result != STATUS_OK) {
+		ERROR (abstract->context, "The watch refused the stream for %s (status %u).", path, result);
+		status = DC_STATUS_PROTOCOL;
+		goto error_release;
+	}
+
+	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_STREAM);
 	if (status != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to set the stream timeout.");
-		goto restore;
+		ERROR (abstract->context, "Failed to set the timeout.");
+		goto error_unsubscribe;
 	}
 
-	for (unsigned int i = 0; i < MAX_CHUNKS; i++) {
-		unsigned char packet[MAX_PACKET] = {0};
-		size_t len = 0;
-		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
+	// The watch streams the whole resource without acknowledgements, and
+	// repeats its last chunk until the subscription ends.
+	dc_buffer_clear (buffer);
+	while (1) {
+		if (device_is_cancelled (abstract)) {
+			status = DC_STATUS_CANCELLED;
+			break;
+		}
+
+		unsigned char chunk[MAX_PAYLOAD] = {0};
+		size_t chunk_len = 0;
+		status = suunto_nautic_recv (device, RPC_OP_NOTIFICATION, 0, chunk, sizeof (chunk), &chunk_len);
+		if (status == DC_STATUS_TIMEOUT) {
+			WARNING (abstract->context, "The stream for %s ended without an end marker.", path);
+			status = DC_STATUS_SUCCESS;
+			break;
+		}
 		if (status != DC_STATUS_SUCCESS) {
-			if (status == DC_STATUS_TIMEOUT)
-				break;
-			ERROR (abstract->context, "Failed to receive a stream chunk.");
-			goto restore;
-		}
-
-		if (len == 0)
+			ERROR (abstract->context, "Failed to receive the stream for %s.", path);
 			break;
+		}
 
-		if (len >= 2 && packet[0] == 0xA5 && packet[1] == RPC_OP_STREAM_END)
+		if (chunk_len < CHUNK_DATA) {
+			ERROR (abstract->context, "Unexpected chunk size (" DC_PRINTF_SIZE ").", chunk_len);
+			status = DC_STATUS_PROTOCOL;
 			break;
-
-		// The watch can refuse the stream with a short status frame (op 0x08)
-		// instead of streaming MDS chunks -- notably HTTP-style status 423
-		// (Locked) when this dive's GET lands before the previous dive's stream
-		// session has been torn down (back-to-back downloads share one BLE
-		// link). A status-200 op 0x08 is the normal stream-start ack and is
-		// ignored here; a non-200 one is surfaced so the caller can back off
-		// and retry rather than silently collecting nothing and reporting the
-		// dive as empty/aborted.
-		if (len >= RPC_STATUS_OFFSET + 2 && packet[0] == 0xA5 && packet[1] == 0x08) {
-			unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
-			if (frame_status != RPC_STATUS_OK) {
-				ERROR (abstract->context, "Watch refused the stream for %s (status %u).", path, frame_status);
-				status = DC_STATUS_PROTOCOL;
-				goto restore;
-			}
 		}
 
-		if (len >= 2 && packet[0] == 0xA5 && packet[1] == 0x01) {
-			status = suunto_nautic_append_chunk (abstract->context, raw, packet, len);
-			if (status != DC_STATUS_SUCCESS)
-				goto restore;
-		}
-	}
-	status = DC_STATUS_SUCCESS;
-
-	// 4. Unsubscribe. Collection above stops on an inter-frame silence, but
-	// the watch still considers the stream open -- it even retransmits its
-	// last chunk waiting to be told we are done -- and refuses the next
-	// dive's stream with 423 Locked. The watch answers with a STREAM_END
-	// (0x09) frame. Best-effort: we already have the payload, so a failed
-	// teardown only warns.
-	unsigned char stop[32];
-	unsigned int stop_len = 0;
-	int stopped = suunto_nautic_build_handle_op (stop, sizeof (stop), &stop_len, device->sequence,
-		RPC_OP_UNSUBSCRIBE, handle) == DC_STATUS_SUCCESS;
-	if (stopped) {
-		device->sequence++;
-		stopped = dc_iostream_write (device->iostream, stop, stop_len, NULL) == DC_STATUS_SUCCESS;
-	}
-	if (stopped) {
-		// Drain until the STREAM_END ack (or a short silence): a few trailing
-		// chunks can still arrive between our UNSUBSCRIBE and the watch acting
-		// on it, and they belong to this dive.
-		dc_iostream_set_timeout (device->iostream, 2000);
-		for (unsigned int i = 0; i < 16; i++) {
-			unsigned char packet[MAX_PACKET] = {0};
-			size_t len = 0;
-			if (dc_iostream_read (device->iostream, packet, sizeof (packet), &len) != DC_STATUS_SUCCESS || len == 0)
-				break;
-			if (len >= 2 && packet[0] == 0xA5 && packet[1] == RPC_OP_STREAM_END)
-				break;
-			if (len >= 2 && packet[0] == 0xA5 && packet[1] == 0x01)
-				suunto_nautic_append_chunk (abstract->context, raw, packet, len);
-		}
-	} else {
-		WARNING (abstract->context, "Failed to unsubscribe from %s; the next dive may be refused with 423.", path);
-	}
-
-restore:
-	if (dc_iostream_set_timeout (device->iostream, 5000) != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to restore the timeout.");
-		if (status == DC_STATUS_SUCCESS)
-			status = DC_STATUS_IO;
-	}
-
-release:
-	suunto_nautic_release_handle (abstract, handle);
-	return status;
-}
-
-// A well-formed RPC frame from the watch starts with the 0xA5 magic and is long
-// enough to carry an opcode. Anything shorter is line noise or a truncated read.
-static int
-suunto_nautic_frame_wellformed (const unsigned char *packet, size_t len)
-{
-	return len >= 2 && packet[0] == 0xA5;
-}
-
-// The DATA (0x05) frame a fetch is waiting for: our opcode, carrying the 3-byte
-// session handle this fetch was issued against.
-static int
-suunto_nautic_frame_is_our_data (const unsigned char *packet, size_t len, const unsigned char handle[3])
-{
-	return len >= RPC_HANDLE_OFFSET + 3 &&
-		packet[0] == 0xA5 && packet[1] == RPC_OP_DATA &&
-		memcmp (packet + RPC_HANDLE_OFFSET, handle, 3) == 0;
-}
-
-// A single BLE link is shared: another client (most often the official Suunto
-// app holding a live logbook subscription) can flood it with its own frames --
-// notably Whiteboard 0x07 subscribe-result traffic on a different handle. Those
-// are well-formed frames that just aren't ours, so skip them freely rather than
-// treating them as a data error. This cap only guards against an unbounded loop;
-// in practice the read below times out first (a clean DC_STATUS_TIMEOUT) when
-// our DATA frame never gets a turn on the contended link.
-#define MAX_FOREIGN_SKIPS 256
-// A tight cap on genuinely malformed/truncated frames: those do signal a real
-// data-format problem, so give up quickly with DC_STATUS_DATAFORMAT.
-#define MAX_MALFORMED_SKIPS 8
-
-// Page through a resource on `handle` with repeated ranged 0x0D fetches,
-// looping while the page status is 100 (more pages) until 200 (last page),
-// stripping the 10-byte REST sub-header from each page and accumulating the
-// raw (uncompressed) SBEM bytes into `response`. The per-page REST sub-header
-// (at packet+4) is [msgid:2][handle:3][flags:3][status:2 LE].
-static dc_status_t
-suunto_nautic_fetch_pages (dc_device_t *abstract, const char *path, const unsigned char handle[3], dc_buffer_t *response)
-{
-	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
-	dc_status_t status = DC_STATUS_SUCCESS;
-
-	dc_buffer_clear (response);
-	unsigned int offset = 0;
-	const unsigned int header = 4 + 10; // A5 05 sublen(2) + 10-byte REST sub-header
-
-	for (unsigned int page = 0; page < MAX_PAGES; page++) {
-		unsigned char fetch[32];
-		unsigned int fetch_len = 0;
-		status = suunto_nautic_build_paginated_fetch (fetch, sizeof (fetch), &fetch_len,
-			device->sequence, handle, offset);
-		if (status != DC_STATUS_SUCCESS)
-			return status;
-		device->sequence++;
-
-		status = dc_iostream_write (device->iostream, fetch, fetch_len, NULL);
-		if (status != DC_STATUS_SUCCESS) {
-			ERROR (abstract->context, "Failed to send paginated fetch (offset=%u) for %s.", offset, path);
-			return status;
-		}
-
-		// Read the page, skipping unsolicited/interleaved frames: the watch
-		// multiplexes other resources (device info, analytics, a re-sent Hello)
-		// on the same link, and another client (the Suunto app's logbook
-		// subscription) can flood it with foreign frames. Accept only a DATA
-		// (0x05) frame whose handle matches this fetch; skip anything else so a
-		// foreign frame isn't spliced into the paginated stream.
-		unsigned char packet[MAX_PACKET] = {0};
-		size_t len = 0;
-		unsigned int foreign_skips = 0;
-		unsigned int malformed_skips = 0;
-		for (;;) {
-			status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
-			if (status != DC_STATUS_SUCCESS) {
-				// A contended link (another client holding a subscription) means
-				// our DATA never gets a turn and this read times out. Surface it
-				// as-is (DC_STATUS_TIMEOUT) rather than a misleading DATAFORMAT.
-				ERROR (abstract->context, "Failed to receive page %u for %s.", page, path);
-				return status;
-			}
-			HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "PFETCH RSP", packet, len);
-			if (suunto_nautic_frame_is_our_data (packet, len, handle))
-				break;
-			if (suunto_nautic_frame_wellformed (packet, len)) {
-				if (++foreign_skips >= MAX_FOREIGN_SKIPS) {
-					ERROR (abstract->context, "Link saturated by another client while paging %s; giving up.", path);
-					return DC_STATUS_TIMEOUT;
-				}
-				WARNING (abstract->context, "Skipping frame from another client while paging %s (op 0x%02x).",
-					path, packet[1]);
-				continue;
-			}
-			if (++malformed_skips >= MAX_MALFORMED_SKIPS) {
-				ERROR (abstract->context, "Too many malformed frames for %s page %u (" DC_PRINTF_SIZE " bytes).", path, page, len);
-				return DC_STATUS_DATAFORMAT;
-			}
-			WARNING (abstract->context, "Skipping malformed frame while paging %s (" DC_PRINTF_SIZE " bytes).", path, len);
-		}
-
-		unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
-		if (frame_status != RPC_STATUS_OK && frame_status != RPC_STATUS_CONTINUE) {
-			ERROR (abstract->context, "Watch returned status %u for %s page %u.", frame_status, path, page);
-			return DC_STATUS_PROTOCOL;
-		}
-
-		if (len > header) {
-			if (!dc_buffer_append (response, packet + header, len - header)) {
-				ERROR (abstract->context, "Failed to allocate memory.");
-				return DC_STATUS_NOMEMORY;
-			}
-			offset += (unsigned int) (len - header);
-		}
-
-		if (frame_status == RPC_STATUS_OK) {
-			DEBUG (abstract->context, "Paginated fetch done: %u page(s), " DC_PRINTF_SIZE " bytes for %s.",
-				page + 1, dc_buffer_get_size (response), path);
-			return DC_STATUS_SUCCESS;
-		}
-	}
-
-	WARNING (abstract->context, "Paginated fetch hit the page limit for %s -- data may be truncated.", path);
-	return DC_STATUS_SUCCESS;
-}
-
-// Fetch a resource the watch paginates (e.g. /Logbook/byId/<id>/Summary):
-// GET -> ACK(handle) -> pages -> RELEASE.
-static dc_status_t
-suunto_nautic_device_paginated_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
-{
-	unsigned char handle[3];
-	dc_status_t status = suunto_nautic_get_handle (abstract, path, handle);
-	if (status != DC_STATUS_SUCCESS)
-		return status;
-
-	status = suunto_nautic_fetch_pages (abstract, path, handle, response);
-	suunto_nautic_release_handle (abstract, handle);
-	return status;
-}
-
-// Fetch a small whole resource (e.g. /Logbook/Entries) via the official
-// app's GET -> ACK(handle) -> SHORT-FETCH(0x0D) -> DATA(0x05) flow. The
-// listing endpoints don't answer the 0x0B/0x10 stream-fetch triggers, only
-// this no-range 0x0D form. `response` receives the raw DATA-frame content
-// (everything after the A5 05 sublen header). Assumes the resource fits in
-// one DATA frame, which holds for a normal logbook.
-// GET -> ACK(handle) -> 0x0D short fetch -> read one frame. Returns the RAW
-// frame bytes (the whole A5.. packet) in `frame`, with NO opcode validation.
-// suunto_nautic_device_short_fetch() validates and extracts the content.
-static dc_status_t
-suunto_nautic_short_fetch_frame (dc_device_t *abstract, const char *path, dc_buffer_t *frame, int skip_non_data)
-{
-	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
-	dc_status_t status = DC_STATUS_SUCCESS;
-
-	// 1. GET the resource; the ACK carries the 3-byte session handle.
-	unsigned char handle[3];
-	status = suunto_nautic_get_handle (abstract, path, handle);
-	if (status != DC_STATUS_SUCCESS)
-		return status;
-
-	// 2. SHORT fetch (no range header) reads the whole small resource.
-	unsigned char fetch[32];
-	unsigned int fetch_len = 0;
-	status = suunto_nautic_build_short_fetch (fetch, sizeof (fetch), &fetch_len, device->sequence, handle);
-	if (status != DC_STATUS_SUCCESS)
-		goto release;
-	device->sequence++;
-
-	status = dc_iostream_write (device->iostream, fetch, fetch_len, NULL);
-	if (status != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to send the short fetch for %s.", path);
-		goto release;
-	}
-
-	// 3. Read the response frame. The watch occasionally injects an
-	// unsolicited Hello frame (op 0x12/0x13) mid-session, and a single blind
-	// read can grab that instead of the DATA frame -- an intermittent
-	// DC_STATUS_DATAFORMAT. When skip_non_data is set, skip frames that aren't
-	// a DATA (0x05) frame until the real one arrives (bounded). The raw
-	// diagnostic passes 0 and returns the very first frame, whatever it is.
-	unsigned char packet[MAX_PACKET] = {0};
-	size_t len = 0;
-	unsigned int foreign_skips = 0;
-	unsigned int malformed_skips = 0;
-	for (;;) {
-		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
-		if (status != DC_STATUS_SUCCESS) {
-			// A contended link (another client holding a subscription) means our
-			// DATA never gets a turn and this read times out. Surface it as-is
-			// (DC_STATUS_TIMEOUT) rather than a misleading DATAFORMAT.
-			ERROR (abstract->context, "Failed to receive the data for %s.", path);
-			goto release;
-		}
-		HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "FETCH RSP", packet, len);
-		if (!skip_non_data)
+		unsigned int offset = array_uint32_le (chunk + CHUNK_OFFSET);
+		unsigned int length = array_uint16_le (chunk + CHUNK_LENGTH);
+		if (CHUNK_DATA + length > chunk_len) {
+			ERROR (abstract->context, "Unexpected chunk length (%u " DC_PRINTF_SIZE ").", length, chunk_len);
+			status = DC_STATUS_PROTOCOL;
 			break;
-		// Accept only a DATA (0x05) frame whose 3-byte handle matches the one
-		// this fetch was issued against. The watch interleaves unsolicited frames
-		// (a re-sent Hello, an analytics/event stream), and another client (the
-		// Suunto app's logbook subscription: 0x07 subscribe-result traffic on a
-		// different handle) can flood the shared link. A blind read would grab
-		// those -- surfacing as an intermittent DC_STATUS_DATAFORMAT or, worse,
-		// the wrong resource's bytes. Skip anything that isn't our DATA frame.
-		if (suunto_nautic_frame_is_our_data (packet, len, handle))
-			break;
-		if (suunto_nautic_frame_wellformed (packet, len)) {
-			if (++foreign_skips >= MAX_FOREIGN_SKIPS) {
-				ERROR (abstract->context, "Link saturated by another client while fetching %s; giving up.", path);
-				status = DC_STATUS_TIMEOUT;
-				goto release;
-			}
-			WARNING (abstract->context, "Skipping frame from another client while fetching %s (op 0x%02x).",
-				path, packet[1]);
+		}
+
+		size_t received = dc_buffer_get_size (buffer);
+		if (offset < received) {
+			// A repeated chunk.
 			continue;
 		}
-		if (++malformed_skips >= MAX_MALFORMED_SKIPS) {
-			ERROR (abstract->context, "Too many malformed frames while fetching %s (" DC_PRINTF_SIZE " bytes).", path, len);
-			status = DC_STATUS_DATAFORMAT;
-			goto release;
+		if (offset > received) {
+			ERROR (abstract->context, "Missing stream data (%u " DC_PRINTF_SIZE ").", offset, received);
+			status = DC_STATUS_PROTOCOL;
+			break;
 		}
-		WARNING (abstract->context, "Skipping malformed frame while fetching %s (" DC_PRINTF_SIZE " bytes).", path, len);
+
+		if (length == 0)
+			break;
+
+		if (!dc_buffer_append (buffer, chunk + CHUNK_DATA, length)) {
+			ERROR (abstract->context, "Failed to allocate memory.");
+			status = DC_STATUS_NOMEMORY;
+			break;
+		}
 	}
 
-	dc_buffer_clear (frame);
-	if (!dc_buffer_append (frame, packet, len)) {
+error_unsubscribe:
+	// Without the UNSUBSCRIBE the watch keeps streaming, and the next GET of a
+	// stream is refused with status 423.
+	rc = suunto_nautic_transfer (device, RPC_OP_UNSUBSCRIBE, RPC_OP_UNSUBSCRIBE_REPLY,
+		handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), &reply_len);
+	if (rc != DC_STATUS_SUCCESS)
+		WARNING (abstract->context, "Failed to unsubscribe from %s.", path);
+
+	rc = dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
+	if (rc != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to restore the timeout.");
+		dc_status_set_error (&status, rc);
+	}
+
+error_release:
+	suunto_nautic_release (device, handle);
+	return status;
+}
+
+// Read a paged resource (/Summary). Each page is requested by the offset of
+// its data, and the last page has status 200.
+static dc_status_t
+suunto_nautic_fetch_pages (suunto_nautic_device_t *device, const char *path, dc_buffer_t *buffer)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	unsigned int handle = 0;
+	status = suunto_nautic_get_handle (device, path, &handle);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	dc_buffer_clear (buffer);
+	unsigned int offset = 0;
+	while (1) {
+		unsigned char params[7] = {0x01, PARAM_INT32, 0x00};
+		array_uint32_le_set (params + 3, offset);
+
+		unsigned char reply[MAX_PAYLOAD] = {0};
+		size_t reply_len = 0;
+		status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
+			handle, params, sizeof (params), reply, sizeof (reply), &reply_len);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to fetch %s (offset %u).", path, offset);
+			break;
+		}
+
+		unsigned int result = array_uint16_le (reply + REPLY_STATUS);
+		if (result != STATUS_OK && result != STATUS_CONTINUE) {
+			ERROR (abstract->context, "Failed to fetch %s (status %u).", path, result);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		if (reply_len < REPLY_CONTENT + PAGE_HEADER) {
+			ERROR (abstract->context, "Unexpected page size (" DC_PRINTF_SIZE ").", reply_len);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		unsigned int length = array_uint16_le (reply + REPLY_CONTENT + PAGE_LENGTH);
+		if (REPLY_CONTENT + PAGE_HEADER + length > reply_len) {
+			ERROR (abstract->context, "Unexpected page length (%u " DC_PRINTF_SIZE ").", length, reply_len);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		if (!dc_buffer_append (buffer, reply + REPLY_CONTENT + PAGE_HEADER, length)) {
+			ERROR (abstract->context, "Failed to allocate memory.");
+			status = DC_STATUS_NOMEMORY;
+			break;
+		}
+		offset += length;
+
+		if (result == STATUS_OK)
+			break;
+
+		if (length == 0) {
+			ERROR (abstract->context, "Empty page with more pages pending.");
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+	}
+
+	suunto_nautic_release (device, handle);
+	return status;
+}
+
+// Read a small resource that fits in a single reply (/Info).
+static dc_status_t
+suunto_nautic_fetch (suunto_nautic_device_t *device, const char *path, dc_buffer_t *buffer)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	unsigned int handle = 0;
+	status = suunto_nautic_get_handle (device, path, &handle);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	unsigned char reply[MAX_PAYLOAD] = {0};
+	size_t reply_len = 0;
+	status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
+		handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), &reply_len);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to fetch %s.", path);
+		goto error_release;
+	}
+
+	unsigned int result = array_uint16_le (reply + REPLY_STATUS);
+	if (result != STATUS_OK) {
+		ERROR (abstract->context, "Failed to fetch %s (status %u).", path, result);
+		status = DC_STATUS_PROTOCOL;
+		goto error_release;
+	}
+
+	dc_buffer_clear (buffer);
+	if (!dc_buffer_append (buffer, reply + REPLY_CONTENT, reply_len - REPLY_CONTENT)) {
 		ERROR (abstract->context, "Failed to allocate memory.");
 		status = DC_STATUS_NOMEMORY;
 	}
 
-release:
-	suunto_nautic_release_handle (abstract, handle);
+error_release:
+	suunto_nautic_release (device, handle);
 	return status;
 }
 
-static dc_status_t
-suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+static void
+suunto_nautic_entries_free (suunto_nautic_entries_t *entries)
 {
-	dc_buffer_t *frame = dc_buffer_new (0);
-	if (frame == NULL)
-		return DC_STATUS_NOMEMORY;
+	free (entries->ids);
+	free (entries->sizes);
+	memset (entries, 0, sizeof (*entries));
+}
 
-	dc_status_t status = suunto_nautic_short_fetch_frame (abstract, path, frame, 1);
+static int
+suunto_nautic_entries_add (suunto_nautic_entries_t *entries, unsigned int id, unsigned int size)
+{
+	for (unsigned int i = 0; i < entries->count; i++) {
+		if (entries->ids[i] == id)
+			return 1;
+	}
+
+	if (entries->count == entries->capacity) {
+		unsigned int capacity = entries->capacity ? entries->capacity * 2 : 32;
+		unsigned int *ids = (unsigned int *) realloc (entries->ids, capacity * sizeof (unsigned int));
+		if (ids == NULL)
+			return 0;
+		entries->ids = ids;
+		unsigned int *sizes = (unsigned int *) realloc (entries->sizes, capacity * sizeof (unsigned int));
+		if (sizes == NULL)
+			return 0;
+		entries->sizes = sizes;
+		entries->capacity = capacity;
+	}
+
+	entries->ids[entries->count] = id;
+	entries->sizes[entries->count] = size;
+	entries->count++;
+
+	return 1;
+}
+
+// List the dives, newest first. The list is served oldest first, in pages: a
+// page with status 100 is followed by a fetch for the dives after the last id
+// received, until a page with status 200.
+static dc_status_t
+suunto_nautic_list (suunto_nautic_device_t *device, suunto_nautic_entries_t *entries)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t status = DC_STATUS_SUCCESS;
+	const char *path = "/Logbook/Entries";
+
+	memset (entries, 0, sizeof (*entries));
+
+	unsigned int handle = 0;
+	status = suunto_nautic_get_handle (device, path, &handle);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	unsigned int last = 0;
+	for (unsigned int page = 0; ; page++) {
+		unsigned char params[7] = {0x01, PARAM_UINT32, 0x00};
+		array_uint32_le_set (params + 3, last);
+
+		unsigned char reply[MAX_PAYLOAD] = {0};
+		size_t reply_len = 0;
+		if (page == 0)
+			status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
+				handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), &reply_len);
+		else
+			status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
+				handle, params, sizeof (params), reply, sizeof (reply), &reply_len);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to fetch %s.", path);
+			break;
+		}
+
+		unsigned int result = array_uint16_le (reply + REPLY_STATUS);
+		if (result != STATUS_OK && result != STATUS_CONTINUE) {
+			ERROR (abstract->context, "Failed to fetch %s (status %u).", path, result);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		const unsigned char *data = reply + REPLY_CONTENT;
+		size_t size = reply_len - REPLY_CONTENT;
+		if (size < ENTRIES_COUNT + 2) {
+			ERROR (abstract->context, "Unexpected entries size (" DC_PRINTF_SIZE ").", size);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		unsigned int count = array_uint16_le (data + ENTRIES_COUNT);
+		if (count && ENTRIES_HEADER + count * ENTRY_SIZE > size) {
+			ERROR (abstract->context, "Unexpected number of entries (%u " DC_PRINTF_SIZE ").", count, size);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		unsigned int previous = last;
+		for (unsigned int i = 0; i < count; i++) {
+			const unsigned char *record = data + ENTRIES_HEADER + i * ENTRY_SIZE;
+			last = array_uint32_le (record + ENTRY_START);
+			if (!suunto_nautic_entries_add (entries, last, array_uint32_le (record + ENTRY_LENGTH))) {
+				ERROR (abstract->context, "Failed to allocate memory.");
+				status = DC_STATUS_NOMEMORY;
+				break;
+			}
+		}
+		if (status != DC_STATUS_SUCCESS)
+			break;
+
+		if (result == STATUS_OK)
+			break;
+
+		if (count == 0 || last == previous) {
+			ERROR (abstract->context, "No new entries with more pages pending.");
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+	}
+
+	suunto_nautic_release (device, handle);
+
 	if (status != DC_STATUS_SUCCESS) {
-		dc_buffer_free (frame);
+		suunto_nautic_entries_free (entries);
 		return status;
 	}
 
-	const unsigned char *packet = dc_buffer_get_data (frame);
-	size_t len = dc_buffer_get_size (frame);
-
-	if (len < RPC_STATUS_OFFSET + 2 || packet[0] != 0xA5 || packet[1] != RPC_OP_DATA) {
-		ERROR (abstract->context, "Unexpected data frame for %s (" DC_PRINTF_SIZE " bytes).", path, len);
-		dc_buffer_free (frame);
-		return DC_STATUS_DATAFORMAT;
+	// Sort descending (newest first), keeping each size with its id.
+	for (unsigned int a = 1; a < entries->count; a++) {
+		unsigned int id = entries->ids[a], size = entries->sizes[a];
+		int b = (int) a - 1;
+		while (b >= 0 && entries->ids[b] < id) {
+			entries->ids[b + 1] = entries->ids[b];
+			entries->sizes[b + 1] = entries->sizes[b];
+			b--;
+		}
+		entries->ids[b + 1] = id;
+		entries->sizes[b + 1] = size;
 	}
 
-	// 200 = the whole resource fits in this one frame. 100 = a paginated first
-	// page: the watch has more entries than one page holds and would serve the
-	// rest via a continuation request. The continuation is not followed yet, so
-	// accept the page we got (the most recent dives) rather than failing;
-	// following it would return the older dives beyond this page.
-	unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
-	if (frame_status != RPC_STATUS_OK && frame_status != RPC_STATUS_CONTINUE) {
-		ERROR (abstract->context, "Watch returned status %u for %s (200/100 expected).", frame_status, path);
-		dc_buffer_free (frame);
-		return DC_STATUS_PROTOCOL;
-	}
-
-	// Return the frame content (everything after A5 05 sublen).
-	dc_buffer_clear (response);
-	int ok = dc_buffer_append (response, packet + 4, len - 4);
-	dc_buffer_free (frame);
-	if (!ok) {
-		ERROR (abstract->context, "Failed to allocate memory.");
-		return DC_STATUS_NOMEMORY;
-	}
-
-	return DC_STATUS_SUCCESS;
+	return status;
 }
 
+// Download one dive: the decompressed /Data stream with the /Summary
+// appended. The listed size is the compressed /Data plus the /Summary data
+// bytes, exactly. A mismatch is retried once and then reported through
+// `incomplete`, with the dive left in `buffer`. `unreadable` is set when the
+// transfer matched the listing but holds no dive (an empty or aborted
+// logbook entry), so downloading it again cannot help.
 static dc_status_t
-suunto_nautic_device_download_summary (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *summary)
+suunto_nautic_download (suunto_nautic_device_t *device, unsigned int id, unsigned int listed,
+	dc_buffer_t *buffer, int *incomplete, int *unreadable)
 {
-	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || summary == NULL)
-		return DC_STATUS_INVALIDARGS;
-
-	char path[128];
-	int n = snprintf (path, sizeof (path), "/Logbook/byId/%s/Summary", logbook_id);
-	if (n < 0 || (size_t) n >= sizeof (path))
-		return DC_STATUS_INVALIDARGS;
-
-	// /Summary uses the paginated 0x0D fetch and is NOT compressed -- the
-	// result is raw SBEM0103 (the caller locates the signature and reads
-	// its fields, e.g. gradient factors and gas mix).
-	return suunto_nautic_device_paginated_fetch (abstract, path, summary);
-}
-
-static dc_status_t
-suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *raw)
-{
-	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || raw == NULL)
-		return DC_STATUS_INVALIDARGS;
-
-	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
 
-	char path[128];
-	int n = snprintf (path, sizeof (path), "/Logbook/byId/%s/Data", logbook_id);
-	if (n < 0 || (size_t) n >= sizeof (path))
-		return DC_STATUS_INVALIDARGS;
+	*incomplete = 0;
+	*unreadable = 0;
+
+	char data_path[64], summary_path[64];
+	snprintf (data_path, sizeof (data_path), "/Logbook/byId/%u/Data", id);
+	snprintf (summary_path, sizeof (summary_path), "/Logbook/byId/%u/Summary", id);
 
 	dc_buffer_t *compressed = dc_buffer_new (0);
-	if (compressed == NULL)
-		return DC_STATUS_NOMEMORY;
-
-	// The stream_fetch above unsubscribes and releases its handle after each
-	// dive, so back-to-back downloads no longer collide. This retry stays as a
-	// safety net: if a stream is still refused (status 423 Locked) or comes
-	// back empty, back off -- giving the watch time to finish tearing down --
-	// and try again before skipping the dive.
-	for (unsigned int attempt = 0; attempt < SUUNTO_NAUTIC_DOWNLOAD_RETRIES; attempt++) {
-		if (attempt > 0) {
-			WARNING (abstract->context, "Retrying the download of %s (attempt %u/%u).",
-				logbook_id, attempt + 1, SUUNTO_NAUTIC_DOWNLOAD_RETRIES);
-			dc_iostream_sleep (device->iostream, 1500 * attempt);
-		}
-		dc_buffer_clear (compressed);
-		status = suunto_nautic_device_stream_fetch (abstract, path, compressed);
-		if (status == DC_STATUS_SUCCESS && dc_buffer_get_size (compressed) > 0)
-			break;
-		status = DC_STATUS_PROTOCOL;
-	}
-	if (status != DC_STATUS_SUCCESS) {
-		dc_buffer_free (compressed);
-		return status;
-	}
-
-	DEBUG (abstract->context, "Captured " DC_PRINTF_SIZE " compressed bytes for logbook entry %s.",
-		dc_buffer_get_size (compressed), logbook_id);
-
-	// Decompress and verify the SBEM0103 magic.
-	status = suunto_nautic_heatshrink_decompress (abstract->context,
-		dc_buffer_get_data (compressed), dc_buffer_get_size (compressed), raw);
-	dc_buffer_free (compressed);
-	if (status != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to decompress the logbook entry.");
-		return status;
-	}
-
-	if (dc_buffer_get_size (raw) < sizeof (SBEM_MAGIC) ||
-		memcmp (dc_buffer_get_data (raw), SBEM_MAGIC, sizeof (SBEM_MAGIC)) != 0) {
-		ERROR (abstract->context, "Unexpected magic in the decompressed data.");
-		return DC_STATUS_DATAFORMAT;
-	}
-
-	DEBUG (abstract->context, "Decompressed " DC_PRINTF_SIZE " bytes for logbook entry %s.",
-		dc_buffer_get_size (raw), logbook_id);
-
-	// Append the /Summary SBEM (gradient factors, gas mix) after the
-	// profile, so the parser can expose them via DC_FIELD_DECOMODEL /
-	// DC_FIELD_GASMIX -- these aren't in the profile stream. Best-effort:
-	// the profile alone is still a valid dive if this fails.
 	dc_buffer_t *summary = dc_buffer_new (0);
-	if (summary != NULL) {
-		if (suunto_nautic_device_download_summary (abstract, logbook_id, summary) == DC_STATUS_SUCCESS &&
-			dc_buffer_get_size (summary) > 0) {
-			if (!dc_buffer_append (raw, dc_buffer_get_data (summary), dc_buffer_get_size (summary)))
-				WARNING (abstract->context, "Failed to append the Summary; GF/gas will be unavailable.");
+	if (compressed == NULL || summary == NULL) {
+		ERROR (abstract->context, "Failed to allocate memory.");
+		status = DC_STATUS_NOMEMORY;
+		goto error_free;
+	}
+
+	for (unsigned int attempt = 0; attempt < DOWNLOAD_ATTEMPTS; attempt++) {
+		for (unsigned int i = 0; i < STREAM_ATTEMPTS; i++) {
+			if (i > 0) {
+				WARNING (abstract->context, "Retrying the stream of dive %u.", id);
+				dc_iostream_sleep (device->iostream, 1500 * i);
+			}
+			status = suunto_nautic_stream (device, data_path, compressed);
+			if (status != DC_STATUS_PROTOCOL)
+				break;
+		}
+		if (status != DC_STATUS_SUCCESS)
+			goto error_free;
+
+		// The profile is still a valid dive without the /Summary.
+		size_t summary_size = 0;
+		if (suunto_nautic_fetch_pages (device, summary_path, summary) == DC_STATUS_SUCCESS) {
+			summary_size = dc_buffer_get_size (summary);
 		} else {
-			WARNING (abstract->context, "Failed to fetch the Summary for %s; GF/gas will be unavailable.", logbook_id);
+			WARNING (abstract->context, "Failed to fetch the summary of dive %u.", id);
+			dc_buffer_clear (summary);
 		}
-		dc_buffer_free (summary);
+
+		if (listed == 0)
+			break;
+
+		size_t data_size = dc_buffer_get_size (compressed);
+		if (summary_size)
+			*incomplete = data_size + summary_size != listed;
+		else
+			*incomplete = data_size > listed || listed - data_size > SUMMARY_MAX_SIZE;
+		if (!*incomplete)
+			break;
+
+		WARNING (abstract->context, "Incomplete download of dive %u (" DC_PRINTF_SIZE " + " DC_PRINTF_SIZE " bytes, listed %u).",
+			id, data_size, summary_size, listed);
 	}
 
-	return DC_STATUS_SUCCESS;
-}
+	status = suunto_nautic_heatshrink_decompress (abstract->context,
+		dc_buffer_get_data (compressed), dc_buffer_get_size (compressed), buffer);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to decompress dive %u.", id);
+		*unreadable = status == DC_STATUS_DATAFORMAT && !*incomplete;
+		goto error_free;
+	}
 
-// Extract dive-start ids from a /Logbook/Entries response, newest-first. Each
-// entry is a start timestamp immediately followed by its end timestamp
-// (end > start, within a day), both 4-aligned little-endian uint32s in the
-// dive-ID window; a lone in-range value with no paired end is a header/misc
-// field (the response's own "current time"), not a dive. Writes up to max_ids
-// ids and returns the count.
-static unsigned int
-suunto_nautic_extract_entry_ids (const unsigned char *data, size_t size,
-	unsigned int *ids, unsigned int max_ids)
-{
-	unsigned int count = 0;
-	for (size_t i = 0; i + 8 <= size && count < max_ids; i += 4) {
-		unsigned int v = array_uint32_le (data + i);
-		if (v < DIVE_ID_MIN || v > DIVE_ID_MAX)
-			continue;
-		unsigned int next = array_uint32_le (data + i + 4);
-		if (next >= DIVE_ID_MIN && next <= DIVE_ID_MAX &&
-				next > v && next - v <= DIVE_ENTRY_MAX_PAIR_GAP) {
-			ids[count++] = v; // start of a (start, end) pair
-			i += 4;           // skip the paired end timestamp
-		}
+	if (dc_buffer_get_size (buffer) < sizeof (SBEM_MAGIC) ||
+		memcmp (dc_buffer_get_data (buffer), SBEM_MAGIC, sizeof (SBEM_MAGIC)) != 0) {
+		ERROR (abstract->context, "Unexpected magic in dive %u.", id);
+		status = DC_STATUS_DATAFORMAT;
+		*unreadable = !*incomplete;
+		goto error_free;
 	}
-	// Sort descending (newest first); insertion sort is fine at logbook scale.
-	for (unsigned int a = 1; a < count; a++) {
-		unsigned int key = ids[a];
-		int b = (int) a - 1;
-		while (b >= 0 && ids[b] < key) { ids[b + 1] = ids[b]; b--; }
-		ids[b + 1] = key;
+
+	// The /Summary goes after the profile, so the parser can read the fields
+	// that are not in the profile (gradient factors, gas mixes).
+	if (!dc_buffer_append (buffer, dc_buffer_get_data (summary), dc_buffer_get_size (summary))) {
+		ERROR (abstract->context, "Failed to allocate memory.");
+		status = DC_STATUS_NOMEMORY;
 	}
-	return count;
+
+error_free:
+	if (status != DC_STATUS_SUCCESS)
+		dc_buffer_clear (buffer);
+	dc_buffer_free (summary);
+	dc_buffer_free (compressed);
+	return status;
 }
 
 // True for a token that is exactly "<digits>.<digits>.<digits>", each part
@@ -1154,72 +1051,67 @@ suunto_nautic_is_serial (const char *tok, size_t len)
 	return 1;
 }
 
-/*
- * Best-effort device info. A short fetch of /Info returns a device-identity
- * record: a run of NUL-separated strings mixed in with binary framing bytes,
- *
- *   Suunto\0 Nautic\0 Vaasa\0 T\0 2604C3003306\0 01385D42<hwpart><...>\0
- *     2.55.46\0 <hwpart>\0 ... SIM\0 <mac>\0 BID\0 <build>\0
- *     BLE Mac Address\0 <mac>\0 WiFi Mac Address\0 <mac>\0
- *
- * (confirmed on a live Nautic, firmware 2.55.46, via fetch_device_info.py).
- * The watch serial is the first 12-char uppercase-hex token and the firmware
- * the first "N.N.N" token; the serial always precedes the firmware, and the
- * BLE/WiFi MACs (also 12 hex) come after it -- so stop looking for a serial
- * once the firmware token is seen. Layered on top of the download; every
- * failure path here is non-fatal.
- *
- * dc_event_devinfo_t carries unsigned ints only: the firmware is packed
- * (a << 16) | (b << 8) | c and the hex serial truncated to its low 32 bits.
- * A consumer wanting the faithful strings should read the BLE advertised
- * name (serial) or GET /Info directly (firmware).
- */
-static void
-suunto_nautic_emit_devinfo (dc_device_t *abstract)
+// /Info is a run of NUL-terminated strings mixed with binary fields:
+//
+//   Suunto\0 Nautic\0 Vaasa\0 T\0 2604C3003306\0 ... 2.55.46\0 ...
+//     BLE Mac Address\0 <mac>\0 WiFi Mac Address\0 <mac>\0
+//
+// The serial is the first 12-character uppercase hex string, and the firmware
+// the first "N.N.N" string, which follows the serial. The MAC addresses after
+// it are also 12 hex characters. The serial is reported as its low 32 bits.
+static dc_status_t
+suunto_nautic_devinfo (suunto_nautic_device_t *device)
 {
-	dc_buffer_t *info = dc_buffer_new (0);
-	if (info == NULL)
-		return;
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t status = DC_STATUS_SUCCESS;
 
-	if (suunto_nautic_device_short_fetch (abstract, "/Info", info) != DC_STATUS_SUCCESS) {
-		dc_buffer_free (info);
-		return; // not fatal -- just no device info this time
+	dc_buffer_t *info = dc_buffer_new (0);
+	if (info == NULL) {
+		ERROR (abstract->context, "Failed to allocate memory.");
+		return DC_STATUS_NOMEMORY;
 	}
 
-	const unsigned char *d = dc_buffer_get_data (info);
-	size_t n = dc_buffer_get_size (info);
+	status = suunto_nautic_fetch (device, "/Info", info);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to read the device info.");
+		dc_buffer_free (info);
+		return status;
+	}
+
+	const unsigned char *data = dc_buffer_get_data (info);
+	size_t size = dc_buffer_get_size (info);
 
 	dc_event_devinfo_t devinfo;
 	memset (&devinfo, 0, sizeof (devinfo));
 
-	// Walk NUL-delimited tokens; the record's strings are NUL-terminated, and
-	// the binary framing bytes between them fail both tests.
 	size_t start = 0;
-	for (size_t i = 0; i < n; i++) {
-		if (d[i] != 0)
+	for (size_t i = 0; i < size; i++) {
+		if (data[i] != 0)
 			continue;
-		const char *tok = (const char *) (d + start);
-		size_t toklen = i - start;
+		const char *token = (const char *) (data + start);
+		size_t length = i - start;
 		unsigned int a, b, c;
-		if (!devinfo.firmware && suunto_nautic_parse_version (tok, toklen, &a, &b, &c))
+		if (!devinfo.firmware && suunto_nautic_parse_version (token, length, &a, &b, &c)) {
 			devinfo.firmware = (a << 16) | (b << 8) | c;
-		else if (!devinfo.firmware && !devinfo.serial && suunto_nautic_is_serial (tok, toklen)) {
-			char buf[13];
-			memcpy (buf, tok, 12);
-			buf[12] = 0;
-			devinfo.serial = (unsigned int) strtoul (buf, NULL, 16);
+		} else if (!devinfo.firmware && !devinfo.serial && suunto_nautic_is_serial (token, length)) {
+			char serial[13];
+			memcpy (serial, token, 12);
+			serial[12] = 0;
+			devinfo.serial = (unsigned int) strtoul (serial, NULL, 16);
 		}
 		start = i + 1;
 	}
 
 	dc_buffer_free (info);
 
-	if (devinfo.firmware || devinfo.serial) {
-		INFO (abstract->context, "Device info: firmware=%u.%u.%u serial=0x%08x",
-			(devinfo.firmware >> 16) & 0xFF, (devinfo.firmware >> 8) & 0xFF,
-			devinfo.firmware & 0xFF, devinfo.serial);
-		device_event_emit (abstract, DC_EVENT_DEVINFO, &devinfo);
+	if (devinfo.firmware == 0 || devinfo.serial == 0) {
+		ERROR (abstract->context, "Failed to find the firmware and serial in the device info.");
+		return DC_STATUS_DATAFORMAT;
 	}
+
+	device_event_emit (abstract, DC_EVENT_DEVINFO, &devinfo);
+
+	return status;
 }
 
 static dc_status_t
@@ -1232,111 +1124,72 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	progress.maximum = 2;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
-	// Connectivity/auth check. Any path works here; /System/Mode is a
-	// fixed, id-less endpoint so it works identically on every unit.
-	dc_buffer_t *mode = dc_buffer_new (0);
-	if (mode == NULL)
-		return DC_STATUS_NOMEMORY;
-
-	status = suunto_nautic_device_request (abstract, "/System/Mode", mode);
-	if (status != DC_STATUS_SUCCESS) {
-		dc_buffer_free (mode);
-		ERROR (abstract->context, "Failed to reach /System/Mode. The EVA handshake or RPC "
-			"framing may need updating for this device (see suunto_nautic.h).");
+	status = suunto_nautic_devinfo (device);
+	if (status != DC_STATUS_SUCCESS)
 		return status;
-	}
-
-	dc_event_vendor_t vendor;
-	vendor.data = dc_buffer_get_data (mode);
-	vendor.size = (unsigned int) dc_buffer_get_size (mode);
-	device_event_emit (abstract, DC_EVENT_VENDOR, &vendor);
-	dc_buffer_free (mode);
-
-	// Best-effort firmware / serial via DC_EVENT_DEVINFO; never fatal.
-	suunto_nautic_emit_devinfo (abstract);
 
 	progress.current = 1;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
-	// /Logbook/Entries returns a small SBEM payload embedding each dive's
-	// LogId (a UNIX timestamp) as a 4-aligned little-endian uint32 among
-	// handle/flag/count/CRC fields; a timestamp-window filter (DIVE_ID_MIN/
-	// MAX) isolates the IDs. Uses the short 0x0D fetch -- the watch rejects
-	// the ranged stream-fetch (used for dive data) here.
-	dc_buffer_t *entries = dc_buffer_new (0);
-	if (entries == NULL)
-		return DC_STATUS_NOMEMORY;
-
-	status = suunto_nautic_device_short_fetch (abstract, "/Logbook/Entries", entries);
+	suunto_nautic_entries_t entries;
+	status = suunto_nautic_list (device, &entries);
 	if (status != DC_STATUS_SUCCESS) {
-		dc_buffer_free (entries);
-		ERROR (abstract->context, "Failed to fetch /Logbook/Entries.");
+		ERROR (abstract->context, "Failed to list the dives.");
 		return status;
 	}
 
-	const unsigned char *entries_data = dc_buffer_get_data (entries);
-	size_t entries_size = dc_buffer_get_size (entries);
-
-	size_t max_ids = entries_size / 4 + 1; // at most one id per 4 bytes
-	unsigned int *ids = (unsigned int *) malloc (max_ids * sizeof (unsigned int));
-	if (ids == NULL) {
-		dc_buffer_free (entries);
-		return DC_STATUS_NOMEMORY;
-	}
-	unsigned int count = suunto_nautic_extract_entry_ids (entries_data, entries_size,
-		ids, (unsigned int) max_ids);
-	dc_buffer_free (entries);
-
-	progress.maximum = (count + 1) * 2;
+	progress.maximum = (entries.count + 1) * 2;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
-	dc_buffer_t *raw = dc_buffer_new (0);
-	if (raw == NULL) {
-		free (ids);
+	dc_buffer_t *buffer = dc_buffer_new (0);
+	if (buffer == NULL) {
+		ERROR (abstract->context, "Failed to allocate memory.");
+		suunto_nautic_entries_free (&entries);
 		return DC_STATUS_NOMEMORY;
 	}
 
-	for (unsigned int i = 0; i < count; i++) {
-		unsigned char fingerprint[4] = {
-			(unsigned char) (ids[i] & 0xFF),
-			(unsigned char) ((ids[i] >> 8) & 0xFF),
-			(unsigned char) ((ids[i] >> 16) & 0xFF),
-			(unsigned char) ((ids[i] >> 24) & 0xFF),
-		};
+	for (unsigned int i = 0; i < entries.count; i++) {
+		unsigned char fingerprint[4];
+		array_uint32_le_set (fingerprint, entries.ids[i]);
 
-		// Walking newest-first, so the first fingerprint match means
-		// everything from here on was already downloaded in a
-		// previous session.
+		// The dives are newest first, so everything from here on was
+		// downloaded before.
 		if (memcmp (fingerprint, device->fingerprint, sizeof (fingerprint)) == 0)
 			break;
 
-		char logbook_id[16];
-		int n = snprintf (logbook_id, sizeof (logbook_id), "%u", ids[i]);
-		if (n < 0 || (size_t) n >= sizeof (logbook_id))
-			continue;
+		if (device_is_cancelled (abstract)) {
+			status = DC_STATUS_CANCELLED;
+			break;
+		}
 
-		dc_buffer_clear (raw);
-		status = suunto_nautic_device_download (abstract, logbook_id, raw);
-		if (status != DC_STATUS_SUCCESS) {
-			// A logbook can contain empty/aborted entries (a zero-length
-			// session is listed in /Logbook/Entries but downloads to no
-			// profile data and fails the SBEM magic check). Skip with a
-			// warning rather than aborting the whole enumeration.
-			WARNING (abstract->context, "Skipping logbook entry %s (download failed, likely an empty/aborted dive).", logbook_id);
+		int incomplete = 0, unreadable = 0;
+		status = suunto_nautic_download (device, entries.ids[i], entries.sizes[i], buffer, &incomplete, &unreadable);
+		if (status != DC_STATUS_SUCCESS && unreadable) {
+			// An empty or aborted entry: listed, but without a dive.
+			WARNING (abstract->context, "Skipping dive %u without any data.", entries.ids[i]);
 			status = DC_STATUS_SUCCESS;
 			continue;
 		}
+		if (status != DC_STATUS_SUCCESS) {
+			// Stop here: the fingerprint of a newer dive would mark this one
+			// as downloaded.
+			ERROR (abstract->context, "Failed to download dive %u.", entries.ids[i]);
+			break;
+		}
+
+		// Delivered anyway: skipping it would move the fingerprint past it.
+		if (incomplete)
+			WARNING (abstract->context, "Dive %u doesn't match its listed size and may be truncated.", entries.ids[i]);
 
 		progress.current += 2;
 		device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
-		if (callback && !callback (dc_buffer_get_data (raw), (unsigned int) dc_buffer_get_size (raw),
-			fingerprint, sizeof (fingerprint), userdata))
+		if (callback && !callback (dc_buffer_get_data (buffer), dc_buffer_get_size (buffer), fingerprint, sizeof (fingerprint), userdata))
 			break;
 	}
 
-	dc_buffer_free (raw);
-	free (ids);
+	dc_buffer_free (buffer);
+	suunto_nautic_entries_free (&entries);
 
-	return DC_STATUS_SUCCESS;
+	return status;
 }
