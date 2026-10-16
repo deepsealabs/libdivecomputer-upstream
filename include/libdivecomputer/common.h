@@ -60,6 +60,7 @@ typedef enum dc_family_t {
 	DC_FAMILY_SUUNTO_VYPER2,
 	DC_FAMILY_SUUNTO_D9,
 	DC_FAMILY_SUUNTO_EONSTEEL,
+	DC_FAMILY_SUUNTO_NAUTIC,
 	/* Reefnet */
 	DC_FAMILY_REEFNET_SENSUS = (2 << 16),
 	DC_FAMILY_REEFNET_SENSUSPRO,
@@ -123,8 +124,6 @@ typedef enum dc_family_t {
 	DC_FAMILY_DIVESOFT_FREEDOM = (23 << 16),
 	/* Halcyon Symbios */
 	DC_FAMILY_HALCYON_SYMBIOS = (24 << 16),
-	/* Suunto Nautic */
-	DC_FAMILY_SUUNTO_NAUTIC = (25 << 16),
 } dc_family_t;
 
 #ifdef __cplusplus

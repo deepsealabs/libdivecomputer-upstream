@@ -102,6 +102,9 @@ dc_parser_new_internal (dc_parser_t **out, dc_context_t *context, const unsigned
 	case DC_FAMILY_SUUNTO_EONSTEEL:
 		rc = suunto_eonsteel_parser_create(&parser, context, data, size, model);
 		break;
+	case DC_FAMILY_SUUNTO_NAUTIC:
+		rc = suunto_nautic_parser_create (&parser, context, data, size);
+		break;
 	case DC_FAMILY_UWATEC_ALADIN:
 	case DC_FAMILY_UWATEC_MEMOMOUSE:
 		rc = uwatec_memomouse_parser_create (&parser, context, data, size);
@@ -208,9 +211,6 @@ dc_parser_new_internal (dc_parser_t **out, dc_context_t *context, const unsigned
 		break;
 	case DC_FAMILY_HALCYON_SYMBIOS:
 		rc = halcyon_symbios_parser_create (&parser, context, data, size);
-		break;
-	case DC_FAMILY_SUUNTO_NAUTIC:
-		rc = suunto_nautic_parser_create (&parser, context, data, size);
 		break;
 	default:
 		return DC_STATUS_INVALIDARGS;
