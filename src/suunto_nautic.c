@@ -62,12 +62,11 @@
 
 // A GET of a per-id path (/Logbook/byId/<id>/...) binds the id to one of the
 // resource's handle slots, [00|10] 24 <resource>, until a RELEASE frees it. A
-// second GET while the 00 slot is still bound gets the 10 slot. Static paths
-// answer with an F0 handle and an unknown path with FF FF FF; neither is
-// released. The slot is the first byte on the wire.
+// second GET while the 00 slot is still bound, e.g. by another app on the
+// link, gets the 10 slot; the handle the GET returns is always the one used.
+// Static paths answer with an F0 handle and an unknown path with FF FF FF;
+// neither is released. The slot is the first byte on the wire.
 #define HANDLE_SLOT(handle) ((handle) & 0xFF)
-#define SLOT_DEFAULT 0x00
-#define SLOT_ALT     0x10
 #define SLOT_STATIC  0xF0
 #define SLOT_UNKNOWN 0xFF
 
@@ -339,9 +338,9 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		return DC_STATUS_NOMEMORY;
 	}
 
-	// Start at a different sequence number on every connection. After a
-	// dropped link the watch can still hold the previous session, and leaves a
-	// request unanswered that reuses one of its sequence numbers.
+	// Start at a different sequence number on every connection, so our
+	// requests are unlikely to share a number with those of another app on
+	// the same link, whose replies we also receive.
 	device->seqnum = ((unsigned int) dc_datetime_now () * 2654435761u) & 0xFFFF;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
 
@@ -464,13 +463,6 @@ suunto_nautic_get_handle (suunto_nautic_device_t *device, const char *path, unsi
 	if (errcode != STATUS_OK) {
 		ERROR (device->base.context, "Failed to resolve %s (status %u).", path, errcode);
 		return DC_STATUS_PROTOCOL;
-	}
-
-	// Every handle is released before the next GET, so a still bound 00 slot
-	// was left by a link that dropped during a transfer.
-	if (HANDLE_SLOT (value) == SLOT_ALT) {
-		WARNING (device->base.context, "Releasing the stale slot of %s.", path);
-		suunto_nautic_release (device, (value & ~0xFFu) | SLOT_DEFAULT);
 	}
 
 	if (handle)
